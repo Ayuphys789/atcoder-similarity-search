@@ -15,6 +15,9 @@ use qdrant_client::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -28,6 +31,56 @@ const EMBEDDING_MODEL: &str = "text-embedding-004";
 const GENERATION_MODEL: &str = "gemini-2.5-flash";
 const EMBEDDING_DIM: usize = 768;
 
+const CONTESTS_API: &str = "https://kenkoooo.com/atcoder/resources/contests.json";
+const SCHEDULE_POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+// ============================================================================
+// Contest Schedule Types
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+struct AtCoderContest {
+    id: String,
+    start_epoch_second: i64,
+    duration_second: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContestSchedule {
+    contests: Vec<AtCoderContest>,
+    last_updated: u64,
+}
+
+impl ContestSchedule {
+    /// Check if any contest is currently running
+    fn is_contest_running(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.contests.iter().any(|contest| {
+            let start = contest.start_epoch_second;
+            let end = start + contest.duration_second;
+            now >= start && now < end
+        })
+    }
+
+    /// Get the currently running contest (if any)
+    fn get_running_contest(&self) -> Option<&AtCoderContest> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.contests.iter().find(|contest| {
+            let start = contest.start_epoch_second;
+            let end = start + contest.duration_second;
+            now >= start && now < end
+        })
+    }
+}
+
 // ============================================================================
 // AppState
 // ============================================================================
@@ -37,6 +90,7 @@ struct AppState {
     qdrant: Arc<Qdrant>,
     gemini_api_key: String,
     http_client: reqwest::Client,
+    contest_schedule: Arc<RwLock<ContestSchedule>>,
 }
 
 // ============================================================================
@@ -84,6 +138,9 @@ enum AppError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Lockdown: Practice mode is disabled during contest ({0})")]
+    Lockdown(String),
 }
 
 impl IntoResponse for AppError {
@@ -92,11 +149,95 @@ impl IntoResponse for AppError {
             AppError::GeminiError(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             AppError::QdrantError(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            AppError::Lockdown(contest_id) => (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Practice mode is disabled during contest. Contest '{}' is currently running. Please use contest mode instead.",
+                    contest_id
+                ),
+            ),
         };
 
-        error!("Request error: {}", message);
+        if matches!(&self, AppError::Lockdown(_)) {
+            warn!("Lockdown access attempt: {}", message);
+        } else {
+            error!("Request error: {}", message);
+        }
+
         (status, Json(json!({ "error": message }))).into_response()
     }
+}
+
+// ============================================================================
+// Contest Schedule Fetching
+// ============================================================================
+
+async fn fetch_contest_schedule(client: &reqwest::Client) -> Result<Vec<AtCoderContest>, String> {
+    let response = client
+        .get(CONTESTS_API)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch contests: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Contest API returned status: {}",
+            response.status()
+        ));
+    }
+
+    let contests: Vec<AtCoderContest> = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse contests: {}", e))?;
+
+    Ok(contests)
+}
+
+async fn update_contest_schedule(
+    client: &reqwest::Client,
+    schedule: &RwLock<ContestSchedule>,
+) {
+    match fetch_contest_schedule(client).await {
+        Ok(contests) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let mut schedule = schedule.write().await;
+            schedule.contests = contests;
+            schedule.last_updated = now;
+
+            info!(
+                "Contest schedule updated: {} contests loaded",
+                schedule.contests.len()
+            );
+
+            // Log if any contest is currently running
+            if let Some(contest) = schedule.get_running_contest() {
+                warn!(
+                    contest_id = %contest.id,
+                    "Contest is currently running - Practice mode is LOCKED"
+                );
+            }
+        }
+        Err(e) => {
+            warn!("Failed to update contest schedule: {}", e);
+        }
+    }
+}
+
+fn spawn_schedule_poller(client: reqwest::Client, schedule: Arc<RwLock<ContestSchedule>>) {
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(SCHEDULE_POLL_INTERVAL_SECS));
+
+        loop {
+            interval.tick().await;
+            update_contest_schedule(&client, &schedule).await;
+        }
+    });
 }
 
 // ============================================================================
@@ -261,8 +402,19 @@ async fn generate_summary(
 // Handlers
 // ============================================================================
 
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "status": "ok" })))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let schedule = state.contest_schedule.read().await;
+    let is_locked = schedule.is_contest_running();
+    let running_contest = schedule.get_running_contest().map(|c| c.id.clone());
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "lockdown": is_locked,
+            "running_contest": running_contest
+        })),
+    )
 }
 
 async fn search(
@@ -270,6 +422,14 @@ async fn search(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, AppError> {
     info!(query = %req.query, mode = ?req.mode, "Search request received");
+
+    // Check lockdown for Practice mode
+    if req.mode == SearchMode::Practice {
+        let schedule = state.contest_schedule.read().await;
+        if let Some(contest) = schedule.get_running_contest() {
+            return Err(AppError::Lockdown(contest.id.clone()));
+        }
+    }
 
     let results = match req.mode {
         SearchMode::Practice => search_practice(&state, &req.query).await?,
@@ -470,11 +630,9 @@ async fn main() {
     let _ = dotenvy::dotenv();
 
     // Load environment variables
-    let gemini_api_key =
-        std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
+    let gemini_api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
     let qdrant_url = std::env::var("QDRANT_URL").expect("QDRANT_URL must be set");
-    let qdrant_api_key =
-        std::env::var("QDRANT_API_KEY").expect("QDRANT_API_KEY must be set");
+    let qdrant_api_key = std::env::var("QDRANT_API_KEY").expect("QDRANT_API_KEY must be set");
 
     // Initialize Qdrant client
     info!("Connecting to Qdrant...");
@@ -491,10 +649,22 @@ async fn main() {
         }
     }
 
+    // Initialize contest schedule
+    let http_client = reqwest::Client::new();
+    let contest_schedule = Arc::new(RwLock::new(ContestSchedule::default()));
+
+    // Fetch initial schedule
+    info!("Fetching initial contest schedule...");
+    update_contest_schedule(&http_client, &contest_schedule).await;
+
+    // Start background schedule poller
+    spawn_schedule_poller(http_client.clone(), contest_schedule.clone());
+
     let state = AppState {
         qdrant: Arc::new(qdrant),
         gemini_api_key,
-        http_client: reqwest::Client::new(),
+        http_client,
+        contest_schedule,
     };
 
     let app = build_router(state);
