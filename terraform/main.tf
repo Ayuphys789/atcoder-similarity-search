@@ -29,11 +29,6 @@ resource "google_cloud_run_service" "api" {
         }
 
         env {
-          name  = "OPENAI_API_KEY"
-          value = var.openai_api_key
-        }
-
-        env {
           name  = "QDRANT_URL"
           value = var.qdrant_url
         }

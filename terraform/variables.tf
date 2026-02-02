@@ -15,13 +15,7 @@ variable "image" {
 }
 
 variable "gemini_api_key" {
-  description = "Gemini API key for summarization"
-  type        = string
-  sensitive   = true
-}
-
-variable "openai_api_key" {
-  description = "OpenAI API key for embeddings"
+  description = "Gemini API key for summarization and embeddings"
   type        = string
   sensitive   = true
 }
