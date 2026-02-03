@@ -525,10 +525,11 @@ async fn search_contest(state: &AppState, query: &str) -> Result<Vec<SearchResul
         return Ok(vec![]);
     }
 
-    // 各キーワードに対してmatch条件を作成（OR検索）
+    // 各キーワードに対してtext match条件を作成（OR検索）
+    // フルテキストインデックスを使用
     let conditions: Vec<Condition> = keywords
         .iter()
-        .map(|kw| Condition::matches("summary", kw.to_string()))
+        .map(|kw| Condition::matches_text("summary", kw.to_string()))
         .collect();
 
     // ダミーベクトルでスクロール検索（キーワードフィルタのみ）
