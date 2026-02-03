@@ -19,6 +19,9 @@ __pycache__/
 venv/
 .env
 
+# Logs
+*.log
+
 # IDE
 .idea/
 .vscode/
