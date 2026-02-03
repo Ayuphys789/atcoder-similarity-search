@@ -40,34 +40,62 @@ CONTESTS_API = "https://kenkoooo.com/atcoder/resources/contests.json"
 client: genai.Client = None
 
 
-def fetch_recent_abc_problems(limit: int = 1) -> list[dict]:
-    """直近のABCコンテストの問題を取得する。"""
+def fetch_all_abc_problems() -> list[dict]:
+    """全てのABCコンテストの問題を取得する（古い順）。"""
     print("Fetching contests...")
     contests = requests.get(CONTESTS_API, timeout=30).json()
 
     now = int(time.time())
 
-    # ABCコンテストをフィルタ（終了済みのみ）し、開始時刻で降順ソート
+    # ABCコンテストをフィルタ（終了済みのみ）し、開始時刻で昇順ソート（古い順）
     abc_contests = [
         c for c in contests
         if c["id"].startswith(ABC_PREFIX)
         and c["id"][3:].isdigit()
         and c["start_epoch_second"] + c["duration_second"] < now  # 終了済みのみ
     ]
-    abc_contests.sort(key=lambda c: c["start_epoch_second"], reverse=True)
-    recent_abc_ids = {c["id"] for c in abc_contests[:limit]}
+    abc_contests.sort(key=lambda c: c["start_epoch_second"])  # 古い順
+    abc_contest_ids = {c["id"] for c in abc_contests}
 
-    print(f"Fetching problems for {len(recent_abc_ids)} contests...")
+    print(f"Found {len(abc_contest_ids)} ABC contests")
+
+    print("Fetching problems...")
     problems = requests.get(PROBLEMS_API, timeout=30).json()
 
-    # 直近ABCの問題をフィルタ
-    recent_problems = [
+    # ABCの問題をフィルタし、contest_idでソート
+    abc_problems = [
         p for p in problems
-        if p["contest_id"] in recent_abc_ids
+        if p["contest_id"] in abc_contest_ids
     ]
+    abc_problems.sort(key=lambda p: (p["contest_id"], p["id"]))
 
-    print(f"Found {len(recent_problems)} problems")
-    return recent_problems
+    print(f"Found {len(abc_problems)} problems total")
+    return abc_problems
+
+
+def get_existing_problem_ids(qdrant: QdrantClient) -> set[str]:
+    """既にQdrantに登録済みの問題IDを取得する。"""
+    existing_ids = set()
+    offset = None
+
+    while True:
+        result = qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100,
+            offset=offset,
+            with_payload=["problem_id"],
+            with_vectors=False,
+        )
+        points, offset = result
+
+        for point in points:
+            if point.payload and "problem_id" in point.payload:
+                existing_ids.add(point.payload["problem_id"])
+
+        if offset is None:
+            break
+
+    return existing_ids
 
 
 def fetch_problem_statement(problem: dict) -> str:
@@ -209,44 +237,75 @@ def upsert_problem(qdrant: QdrantClient, problem: dict, summary: str, embedding:
 def main():
     global client
 
-    print("=== AtCoder Problem Ingestion ===\n")
+    print("=== AtCoder Problem Ingestion (Full) ===\n")
 
     # Qdrant初期化（先にコレクションを確保）
     qdrant = init_qdrant()
 
+    # 既存の問題IDを取得（レジューム用）
+    print("Checking existing problems in Qdrant...")
+    existing_ids = get_existing_problem_ids(qdrant)
+    print(f"Already ingested: {len(existing_ids)} problems")
+
     # Gemini API初期化
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # 直近ABCの問題を取得
-    problems = fetch_recent_abc_problems(limit=1)
+    # 全ABCの問題を取得
+    problems = fetch_all_abc_problems()
+
+    # スキップ済み・処理対象を分離
+    problems_to_process = [p for p in problems if p["id"] not in existing_ids]
+    print(f"To process: {len(problems_to_process)} problems (skipping {len(existing_ids)} already done)\n")
+
+    if not problems_to_process:
+        print("All problems already ingested!")
+        return
 
     # 各問題を処理
-    for i, problem in enumerate(problems):
-        print(f"\n[{i+1}/{len(problems)}] Processing: {problem['id']} - {problem['title']}")
+    success_count = 0
+    error_count = 0
 
-        # 問題文取得
-        print("  Fetching problem statement...")
-        statement = fetch_problem_statement(problem)
-        print(f"  Statement length: {len(statement)} chars")
-        time.sleep(1)  # AtCoderへの負荷軽減
+    for i, problem in enumerate(problems_to_process):
+        print(f"\n[{i+1}/{len(problems_to_process)}] Processing: {problem['id']} - {problem['title']}")
 
-        # 要約生成
-        print("  Generating summary...")
-        summary = generate_summary(problem, statement)
-        print(f"  Summary: {summary[:80]}...")
+        try:
+            # 問題文取得
+            print("  Fetching problem statement...")
+            statement = fetch_problem_statement(problem)
+            print(f"  Statement length: {len(statement)} chars")
+            time.sleep(2)  # AtCoderへの負荷軽減
 
-        # ベクトル化
-        print("  Generating embedding...")
-        embedding = generate_embedding(summary)
+            # 要約生成
+            print("  Generating summary...")
+            summary = generate_summary(problem, statement)
+            print(f"  Summary: {summary[:80]}...")
 
-        # Qdrantにアップロード
-        print("  Uploading to Qdrant...")
-        upsert_problem(qdrant, problem, summary, embedding)
+            # ベクトル化
+            print("  Generating embedding...")
+            embedding = generate_embedding(summary)
 
-        # レート制限対策
-        time.sleep(5)
+            # Qdrantにアップロード
+            print("  Uploading to Qdrant...")
+            upsert_problem(qdrant, problem, summary, embedding)
 
-    print(f"\n=== Done! Ingested {len(problems)} problems ===")
+            success_count += 1
+            print(f"  ✓ Done (total: {success_count + len(existing_ids)})")
+
+        except Exception as e:
+            error_count += 1
+            print(f"  ✗ Error: {e}")
+            # エラーが続く場合は少し待つ
+            time.sleep(30)
+            continue
+
+        # レート制限対策（Gemini API: 15 RPM for free tier）
+        # 1問あたり2リクエスト（summary + embedding）なので、8秒間隔
+        time.sleep(8)
+
+    print(f"\n=== Done! ===")
+    print(f"  New: {success_count}")
+    print(f"  Errors: {error_count}")
+    print(f"  Total in DB: {success_count + len(existing_ids)}")
 
 
 if __name__ == "__main__":
