@@ -1,43 +1,49 @@
 steps:
   # Build the container image
-  - name: 'gcr.io/cloud-builders/docker'
+  - name: "gcr.io/cloud-builders/docker"
     args:
-      - 'build'
-      - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${SHORT_SHA}'
-      - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:latest'
-      - '-f'
-      - 'backend/Dockerfile'
-      - 'backend'
+      - "build"
+      - "-t"
+      - "asia-northeast1-docker.pkg.dev/$PROJECT_ID/atcoder-similarity-search/api:$SHORT_SHA"
+      - "-t"
+      - "asia-northeast1-docker.pkg.dev/$PROJECT_ID/atcoder-similarity-search/api:latest"
+      - "-f"
+      - "backend/Dockerfile"
+      - "backend"
 
   # Push the container image to Artifact Registry
-  - name: 'gcr.io/cloud-builders/docker'
+  - name: "gcr.io/cloud-builders/docker"
     args:
-      - 'push'
-      - '--all-tags'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}'
+      - "push"
+      - "--all-tags"
+      - "asia-northeast1-docker.pkg.dev/$PROJECT_ID/atcoder-similarity-search/api"
 
   # Deploy to Cloud Run
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: gcloud
     args:
-      - 'run'
-      - 'deploy'
-      - '${_SERVICE_NAME}'
-      - '--image'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${SHORT_SHA}'
-      - '--region'
-      - '${_REGION}'
-      - '--platform'
-      - 'managed'
-      - '--allow-unauthenticated'
-
-substitutions:
-  _REGION: asia-northeast1
-  _REPOSITORY: atcoder-search
-  _IMAGE: api
-  _SERVICE_NAME: atcoder-similarity-search-api
+      - "run"
+      - "deploy"
+      - "atcoder-similarity-search-api"
+      - "--image"
+      - "asia-northeast1-docker.pkg.dev/$PROJECT_ID/atcoder-similarity-search/api:$SHORT_SHA"
+      - "--region"
+      - "asia-northeast1"
+      - "--platform"
+      - "managed"
+      - "--allow-unauthenticated"
+      - "--set-secrets"
+      - "GEMINI_API_KEY=gemini-api-key:latest,QDRANT_API_KEY=qdrant-api-key:latest"
+      - "--set-env-vars"
+      - "QDRANT_URL=https://7edf97f9-a920-4347-8c83-aa69ff3d53d4.us-east4-0.gcp.cloud.qdrant.io:6334,RUST_LOG=info"
+      - "--memory"
+      - "512Mi"
+      - "--cpu"
+      - "1"
+      - "--min-instances"
+      - "0"
+      - "--max-instances"
+      - "10"
 
 options:
   logging: CLOUD_LOGGING_ONLY
